@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
+import io
+import os
 import pickle
 import threading
 import time
@@ -343,6 +345,16 @@ class MessageQueue:
         self._is_remote_reader = False
         self._read_spin_timer = SpinTimer()
 
+        self._binary_fastpath = (
+            os.environ.get("VLLM_MQ_BINARY_FASTPATH", "1") == "1"
+            and n_remote_reader == 0  # only safe for local readers
+        )
+        # Reusable pickler buffer to trim allocator churn on the hot path.
+        self._pickle_buf = io.BytesIO()
+        self._pickler = pickle.Pickler(
+            self._pickle_buf, protocol=pickle.HIGHEST_PROTOCOL
+        )
+
         self.handle = Handle(
             local_reader_ranks=local_reader_ranks,
             buffer_handle=self.buffer.handle() if self.buffer is not None else None,
@@ -578,9 +590,21 @@ class MessageQueue:
             total_bytes += len(raw_buf) + 4
             return False
 
-        all_buffers[0] = pickle.dumps(
-            obj, protocol=pickle.HIGHEST_PROTOCOL, buffer_callback=oob_callback
+        # Fast path: raw bytes/memoryview and local-only readers.
+        is_binary = (
+            self._binary_fastpath and isinstance(obj, (bytes, bytearray, memoryview))
         )
+        if is_binary:
+            mv = memoryview(obj)
+            is_contig = getattr(mv, "contiguous", True) if hasattr(mv, "contiguous") else getattr(mv, "c_contiguous", True)
+            all_buffers[0] = mv if is_contig else mv.tobytes()
+            total_bytes = 6  # count + length header overhead
+        else:
+            all_buffers[0] = pickle.dumps(
+                obj,
+                protocol=pickle.HIGHEST_PROTOCOL,
+                buffer_callback=oob_callback,
+            )
         if self.n_local_reader > 0:
             if total_bytes + len(all_buffers[0]) >= self.buffer.max_chunk_bytes:
                 with self.acquire_write(timeout) as buf:
@@ -592,7 +616,7 @@ class MessageQueue:
                 # Then each buffer follows, preceded by 4 bytes containing its length:
                 # [4 byte int L][L bytes of buffer content] ...
                 with self.acquire_write(timeout) as buf:
-                    buf[0] = 0  # not overflow
+                    buf[0] = 2 if is_binary else 0  # not overflow
                     offset = 3
                     buf[1:offset] = to_bytes_big(len(all_buffers), 2)  # oob buf count
                     for buffer in all_buffers:
@@ -624,7 +648,10 @@ class MessageQueue:
                         buf_len = from_bytes_big(buf[offset:buf_offset])
                         offset = buf_offset + buf_len
                         all_buffers.append(buf[buf_offset:offset])
-                    obj = pickle.loads(all_buffers[0], buffers=all_buffers[1:])
+                    if buf[0] == 2 and self._binary_fastpath:
+                        obj = bytes(all_buffers[0])
+                    else:
+                        obj = pickle.loads(all_buffers[0], buffers=all_buffers[1:])
             if overflow:
                 obj = MessageQueue.recv(self.local_socket, timeout)
         elif self._is_remote_reader:
