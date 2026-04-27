@@ -16,6 +16,12 @@ from vllm.distributed.device_communicators.shm_object_storage import (
     SingleWriterShmObjectStorage,
     SingleWriterShmRingBuffer,
 )
+from vllm.distributed.device_communicators.shm_object_storage_provider import (
+    make_reader as _make_mm_reader,
+)
+from vllm.distributed.device_communicators.shm_object_storage_provider import (
+    make_writer as _make_mm_writer,
+)
 from vllm.logger import init_logger
 from vllm.utils.cache import CacheInfo, LRUCache
 from vllm.utils.jsontree import json_count_leaves, json_map_leaves, json_reduce_leaves
@@ -452,15 +458,16 @@ class ShmObjectStoreSenderCache(BaseMultiModalProcessorCache):
         self.world_size = vllm_config.parallel_config.world_size
         mm_config = vllm_config.model_config.get_multimodal_config()
 
-        ring_buffer = SingleWriterShmRingBuffer(
+        # Provider abstraction: lets us swap in a Myelon Rust-backed backend
+        # via VLLM_MM_CACHE_PROVIDER=myelon, and turn on per-op timings via
+        # VLLM_MM_CACHE_INSTRUMENT=1. Default behaviour is unchanged.
+        self._shm_cache = _make_mm_writer(
             data_buffer_size=int(mm_config.mm_processor_cache_gb * GiB_bytes),
             name=envs.VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME,
-            create=True,  # sender is the writer
-        )
-        self._shm_cache = SingleWriterShmObjectStorage(
-            max_object_size=mm_config.mm_shm_cache_max_object_size_mb * MiB_bytes,
+            max_object_size=(
+                mm_config.mm_shm_cache_max_object_size_mb * MiB_bytes
+            ),
             n_readers=self.world_size,
-            ring_buffer=ring_buffer,
             serde_class=MsgpackSerde,
         )
         # cache prompt_updates for P0 only
@@ -679,17 +686,17 @@ class ShmObjectStoreReceiverCache(BaseMultiModalReceiverCache):
         self.world_size = vllm_config.parallel_config.world_size
         mm_config = vllm_config.model_config.get_multimodal_config()
 
-        ring_buffer = SingleWriterShmRingBuffer(
+        # Reader-side provider abstraction. Mirrors the writer-side switch
+        # in ShmObjectStoreSenderCache.
+        self._shm_cache = _make_mm_reader(
             data_buffer_size=int(mm_config.mm_processor_cache_gb * GiB_bytes),
             name=envs.VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME,
-            create=False,  # Server is a reader
-        )
-        self._shm_cache = SingleWriterShmObjectStorage(
-            max_object_size=mm_config.mm_shm_cache_max_object_size_mb * MiB_bytes,
+            max_object_size=(
+                mm_config.mm_shm_cache_max_object_size_mb * MiB_bytes
+            ),
             n_readers=self.world_size,
-            ring_buffer=ring_buffer,
-            serde_class=MsgpackSerde,
             reader_lock=shared_worker_lock,
+            serde_class=MsgpackSerde,
         )
 
     @override
