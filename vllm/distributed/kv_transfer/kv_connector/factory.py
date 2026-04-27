@@ -226,3 +226,13 @@ KVConnectorFactory.register_connector(
     "vllm.distributed.kv_transfer.kv_connector.v1.hf3fs.hf3fs_connector",
     "HF3FSKVConnector",
 )
+
+# RFC 0031: single-host disaggregated PD over Myelon SHM rings. Skeleton
+# only — the underlying `myelon_kv_transport` PyO3 binding lands separately
+# in myelon-playground. Selecting this connector without the binding
+# installed raises a clear ImportError at construction time.
+KVConnectorFactory.register_connector(
+    "MyelonKVConnector",
+    "vllm.distributed.kv_transfer.kv_connector.v1.myelon_connector",
+    "MyelonKVConnector",
+)
