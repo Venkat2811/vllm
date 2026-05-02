@@ -19,6 +19,8 @@ pytestmark = pytest.mark.cpu_test
         ("lmcache", 4.0, 1, 1, "LMCacheConnectorV1", 4.0),
         # size per rank: 8.0 GiB / (2 * 2) = 2.0 GiB
         ("lmcache", 8.0, 2, 2, "LMCacheConnectorV1", 2.0),
+        ("tensorpuffer", 4.0, 1, 1, "OffloadingConnector", None),
+        ("wombatkv", 4.0, 1, 1, "OffloadingConnector", None),
         # When kv_offloading_size is None, offloading is disabled (backend is ignored)
         ("native", None, 1, 1, None, None),
     ],
@@ -63,6 +65,14 @@ def test_kv_connector(
         assert kv_connector_extra_config["lmcache.max_local_cpu_size"] == expected_bytes
         # Existing config should be replaced
         assert "existing_key" not in kv_connector_extra_config
+    elif kv_offloading_backend in ("tensorpuffer", "wombatkv"):
+        assert kv_connector_extra_config["spec_name"] == "WombatKVOffloadingSpec"
+        assert kv_connector_extra_config["spec_module_path"] == "wombat_kv.vllm.spec"
+        assert kv_connector_extra_config["backend"] == "m1"
+        assert kv_connector_extra_config["namespace"] == "vllm"
+        assert kv_connector_extra_config["restore_on_start"] is True
+        # Existing config should be preserved
+        assert kv_connector_extra_config["existing_key"] == "existing_value"
 
 
 def test_kv_offloading_size_only_uses_native_default():

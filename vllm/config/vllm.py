@@ -705,6 +705,23 @@ class VllmConfig:
                 "lmcache.local_cpu": True,
                 "lmcache.max_local_cpu_size": kv_gb_per_rank,
             }
+        elif kv_offloading_backend in ("tensorpuffer", "wombatkv"):
+            self.kv_transfer_config.kv_connector = "OffloadingConnector"
+            self.kv_transfer_config.kv_connector_extra_config.setdefault(
+                "spec_name", "WombatKVOffloadingSpec"
+            )
+            self.kv_transfer_config.kv_connector_extra_config.setdefault(
+                "spec_module_path", "wombat_kv.vllm.spec"
+            )
+            self.kv_transfer_config.kv_connector_extra_config.setdefault(
+                "backend", "m1"
+            )
+            self.kv_transfer_config.kv_connector_extra_config.setdefault(
+                "namespace", "vllm"
+            )
+            self.kv_transfer_config.kv_connector_extra_config.setdefault(
+                "restore_on_start", True
+            )
 
         # This is the same for all backends
         self.kv_transfer_config.kv_role = "kv_both"
