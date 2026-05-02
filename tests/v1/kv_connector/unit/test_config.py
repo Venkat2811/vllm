@@ -3,6 +3,8 @@
 
 """Tests for KV cache offloading configuration."""
 
+import os
+
 import pytest
 
 from vllm.config import CacheConfig, KVTransferConfig, ParallelConfig, VllmConfig
@@ -41,7 +43,12 @@ def test_kv_connector(
         ),
         kv_transfer_config=kv_transfer_config,
         parallel_config=ParallelConfig(
-            tensor_parallel_size=tp, pipeline_parallel_size=pp
+            tensor_parallel_size=tp,
+            pipeline_parallel_size=pp,
+            # This unit test checks KV offload config math, not local GPU
+            # availability. Put synthetic multi-rank cases across nodes so the
+            # test also runs on single-GPU developer machines.
+            nnodes=max(1, tp * pp),
         ),
     )
 
@@ -89,3 +96,30 @@ def test_kv_offloading_size_only_uses_native_default():
     assert kv_transfer_config.kv_connector == "OffloadingConnector"
     assert kv_transfer_config.kv_role == "kv_both"
     assert kv_connector_extra_config["cpu_bytes_to_use"] == 4.0 * (1 << 30)
+
+
+def test_tensorpuffer_sets_deterministic_block_hash_seed(monkeypatch):
+    """Durable offload keys must remain stable across vLLM process restarts."""
+    monkeypatch.delenv("PYTHONHASHSEED", raising=False)
+
+    VllmConfig(
+        cache_config=CacheConfig(
+            kv_offloading_backend="tensorpuffer",
+            kv_offloading_size=4.0,
+        )
+    )
+
+    assert os.environ["PYTHONHASHSEED"] == "0"
+
+
+def test_tensorpuffer_preserves_explicit_block_hash_seed(monkeypatch):
+    monkeypatch.setenv("PYTHONHASHSEED", "1234")
+
+    VllmConfig(
+        cache_config=CacheConfig(
+            kv_offloading_backend="wombatkv",
+            kv_offloading_size=4.0,
+        )
+    )
+
+    assert os.environ["PYTHONHASHSEED"] == "1234"

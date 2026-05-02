@@ -706,6 +706,13 @@ class VllmConfig:
                 "lmcache.max_local_cpu_size": kv_gb_per_rank,
             }
         elif kv_offloading_backend in ("tensorpuffer", "wombatkv"):
+            if "PYTHONHASHSEED" not in os.environ:
+                os.environ["PYTHONHASHSEED"] = "0"
+                logger.info(
+                    "Set PYTHONHASHSEED=0 for deterministic TensorPuffer/"
+                    "WombatKV KV offload block keys. Override PYTHONHASHSEED "
+                    "explicitly to use a different stable seed."
+                )
             self.kv_transfer_config.kv_connector = "OffloadingConnector"
             self.kv_transfer_config.kv_connector_extra_config.setdefault(
                 "spec_name", "WombatKVOffloadingSpec"
