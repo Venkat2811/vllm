@@ -1509,12 +1509,16 @@ class EngineCoreProc(EngineCore):
         # We must set linger to ensure the ENGINE_CORE_DEAD
         # message is sent prior to closing the socket.
         with ExitStack() as stack, zmq.Context() as ctx:
-            sockets = [
-                stack.enter_context(
-                    make_zmq_socket(ctx, output_path, zmq.PUSH, linger=4000)
-                )
-                for output_path in output_paths
-            ]
+            from vllm.utils.myelon_hot_path_loader import is_enabled as _use_myelon, make_output_sender as _mk_send
+            if _use_myelon():
+                sockets = [_mk_send(p) for p in output_paths]
+            else:
+                sockets = [
+                    stack.enter_context(
+                        make_zmq_socket(ctx, output_path, zmq.PUSH, linger=4000)
+                    )
+                    for output_path in output_paths
+                ]
             coord_socket = (
                 stack.enter_context(
                     make_zmq_socket(

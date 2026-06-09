@@ -516,9 +516,16 @@ class MPClient(EngineCoreClient):
                     bind=True,
                     router_handover=enable_input_socket_handover,
                 )
-                self.resources.output_socket = make_zmq_socket(
-                    self.ctx, output_address, zmq.PULL
-                )
+                from vllm.utils.myelon_hot_path_loader import is_enabled as _use_myelon
+                if _use_myelon():
+                    self.resources.output_socket = (
+                        __import__("vllm.utils.myelon_hot_path_loader", fromlist=["make_output_receiver"])
+                        .make_output_receiver(output_address)
+                    )
+                else:
+                    self.resources.output_socket = make_zmq_socket(
+                        self.ctx, output_address, zmq.PULL
+                    )
 
                 # Report bound endpoints back so the parent can forward
                 # them to engines (mirrors the DPCoordinator pattern).
@@ -551,9 +558,16 @@ class MPClient(EngineCoreClient):
                     bind=True,
                     router_handover=enable_input_socket_handover,
                 )
-                self.resources.output_socket = make_zmq_socket(
-                    self.ctx, addresses.outputs[0], zmq.PULL
-                )
+                from vllm.utils.myelon_hot_path_loader import is_enabled as _use_myelon
+                if _use_myelon():
+                    self.resources.output_socket = (
+                        __import__("vllm.utils.myelon_hot_path_loader", fromlist=["make_output_receiver"])
+                        .make_output_receiver(addresses.outputs[0])
+                    )
+                else:
+                    self.resources.output_socket = make_zmq_socket(
+                        self.ctx, addresses.outputs[0], zmq.PULL
+                    )
 
                 # Resolve ``tcp://host:0`` placeholders to bound endpoints
                 # before engines DEALER-connect. No-op for IPC.
