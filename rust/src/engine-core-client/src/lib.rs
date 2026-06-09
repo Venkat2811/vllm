@@ -7,6 +7,8 @@ pub mod protocol;
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_utils;
 mod transport;
+#[cfg(feature = "myelon_hot_path")]
+mod myelon_transport;
 
 pub use client::{
     AbortCause, CoordinatorMode, EngineCoreClient, EngineCoreClientConfig, EngineCoreOutputStream,
