@@ -25,6 +25,7 @@
 //! scenarios where SHM bandwidth (≥10 GB/s) clearly beats pyzmq IPC
 //! (~1-2 GB/s) at the protocol layer.
 
+use std::collections::VecDeque;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -40,6 +41,18 @@ pub const FRAME_BYTES: usize = 2 * 1024 * 1024;
 /// touched pages are resident).
 pub const RING_SLOTS: usize = 256;
 
+/// Per-cycle drain cap. Audit #88: the original `recv()` did
+/// single-message polling + `tokio::task::yield_now()` per message,
+/// paying one tokio yield per RTT. The Python adapter already does
+/// batched draining via `recv_multipart_drain_spin(timeout_us,
+/// max_batch=64)` — that's why py+myelon hit the wins it did. Mirror
+/// the pattern in Rust: drain up to `MAX_DRAIN_BATCH` messages per
+/// cycle into a local VecDeque, then return them one at a time
+/// without yielding between. Amortizes yield + spin-loop cost across
+/// the burst, materially closing the gap with the substrate ceiling
+/// in dispatch-bound workloads.
+pub const MAX_DRAIN_BATCH: usize = 64;
+
 /// Errors raised by `MyelonOutputSocket`.
 #[derive(Debug, thiserror::Error)]
 pub enum MyelonOutputError {
@@ -52,9 +65,20 @@ pub enum MyelonOutputError {
 /// Rust-frontend-side receiver for engine outputs over a myelon SHM
 /// ring. Mirrors the `zeromq::PullSocket` API shape used by
 /// `run_output_loop` so the call site can dispatch via an enum.
+///
+/// Audit #88: the receiver maintains a small in-memory drain buffer
+/// so a single `recv()` returns one message at a time but only pays
+/// the spin + tokio-yield tax once per `MAX_DRAIN_BATCH` messages
+/// drained. Matches the Python adapter's batched drain pattern; the
+/// gap previously made rust+myelon vs rust+pyzmq look like parity
+/// when it may have been measuring an under-optimized receiver.
 pub struct MyelonOutputSocket {
     inner: RecvSocket<FRAME_BYTES>,
     segment: String,
+    /// Pre-drained messages awaiting per-call return. Spin/yield is
+    /// paid only when this is empty; non-empty calls return
+    /// synchronously from the front.
+    pending: VecDeque<Vec<Bytes>>,
 }
 
 impl MyelonOutputSocket {
@@ -70,7 +94,13 @@ impl MyelonOutputSocket {
         let deadline = std::time::Instant::now() + Duration::from_secs(120);
         loop {
             match RecvSocket::connect(&segment, RING_SLOTS, "vlm_0") {
-                Ok(inner) => return Ok(Self { inner, segment }),
+                Ok(inner) => {
+                    return Ok(Self {
+                        inner,
+                        segment,
+                        pending: VecDeque::with_capacity(MAX_DRAIN_BATCH),
+                    });
+                }
                 Err(_) if std::time::Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(25));
                 }
@@ -79,28 +109,63 @@ impl MyelonOutputSocket {
         }
     }
 
-    /// Receive one multipart message. Spins in a tight loop with
-    /// `std::hint::spin_loop()`, yielding to the tokio scheduler
-    /// between probes so other tokio tasks (the HTTP request
-    /// handlers serving 256+ concurrent clients) can run. This
-    /// preserves the same asyncio-fairness property that powers the
-    /// Python adapter's wins, just translated into tokio.
+    /// Receive one multipart message.
+    ///
+    /// Audit #88: batched-drain pattern. If the local pending buffer
+    /// has a message, return it synchronously (no spin, no yield).
+    /// Otherwise spin until at least one message arrives, then drain
+    /// up to `MAX_DRAIN_BATCH` more messages from the ring into
+    /// `pending` BEFORE returning the first. Amortizes the
+    /// `tokio::task::yield_now()` cost across the burst — the Python
+    /// adapter has done this via `recv_multipart_drain_spin` since
+    /// the original GIL-fairness fix; the Rust side was paying the
+    /// per-message yield tax until now.
     pub async fn recv(&mut self) -> Result<Vec<Bytes>, MyelonOutputError> {
+        // Fast path: pre-drained message ready.
+        if let Some(msg) = self.pending.pop_front() {
+            return Ok(msg);
+        }
+        // Slow path: spin until we drain at least one. Then opportunistically
+        // drain more (up to MAX_DRAIN_BATCH-1 extras) so subsequent recv()
+        // calls return from `pending` without spinning.
         loop {
-            let mut got: Option<Vec<Bytes>> = None;
+            // First, try to grab one message from the ring.
+            let mut got_one: Option<Vec<Bytes>> = None;
             self.inner.try_recv_multipart_with(|res| {
                 if let Ok(frames) = res {
-                    let owned: Vec<Bytes> = frames
-                        .iter()
-                        .map(|s| Bytes::copy_from_slice(s))
-                        .collect();
-                    got = Some(owned);
+                    got_one = Some(
+                        frames.iter().map(|s| Bytes::copy_from_slice(s)).collect(),
+                    );
                 }
             });
-            if let Some(msg) = got {
-                return Ok(msg);
+            if let Some(first) = got_one {
+                // We have one — opportunistically drain more without
+                // yielding between. Each try_recv_multipart_with is a
+                // single non-blocking probe; we stop as soon as the
+                // ring is empty.
+                let mut extras_drained = 0;
+                while extras_drained < MAX_DRAIN_BATCH - 1 {
+                    let mut more: Option<Vec<Bytes>> = None;
+                    self.inner.try_recv_multipart_with(|res| {
+                        if let Ok(frames) = res {
+                            more = Some(
+                                frames.iter().map(|s| Bytes::copy_from_slice(s)).collect(),
+                            );
+                        }
+                    });
+                    match more {
+                        Some(msg) => {
+                            self.pending.push_back(msg);
+                            extras_drained += 1;
+                        }
+                        None => break,
+                    }
+                }
+                return Ok(first);
             }
-            // CPU-cache-friendly pause hint before yielding.
+            // No message yet; CPU-friendly pause + tokio yield so
+            // other tasks (HTTP request handlers serving 256+
+            // concurrent clients) can run.
             std::hint::spin_loop();
             tokio::task::yield_now().await;
         }
@@ -116,8 +181,6 @@ impl MyelonOutputSocket {
 /// sides MUST produce the same string for the same input or the
 /// attach fails — keep this in sync with the Python implementation
 /// in `crates/myelon-zmq-py/myelon_pyzmq_shim/hot_path.py`.
-pub fn segment_from_endpoint_for_test(endpoint: &str) -> String { segment_from_endpoint(endpoint) }
-
 fn segment_from_endpoint(endpoint: &str) -> String {
     if let Some(path) = endpoint.strip_prefix("ipc://") {
         let base = path.rsplit('/').next().unwrap_or(path);
@@ -140,6 +203,15 @@ fn segment_from_endpoint(endpoint: &str) -> String {
         let last_chars = endpoint.len().saturating_sub(40);
         endpoint[last_chars..].to_string()
     }
+}
+
+/// Test-visible wrapper around the private `segment_from_endpoint`
+/// so the integration tests under `tests/` can reproduce the exact
+/// segment derivation without making the function public. Kept as a
+/// thin pass-through for now; if the test stops using it the wrapper
+/// can be removed.
+pub fn segment_from_endpoint_for_test(endpoint: &str) -> String {
+    segment_from_endpoint(endpoint)
 }
 
 #[cfg(test)]
