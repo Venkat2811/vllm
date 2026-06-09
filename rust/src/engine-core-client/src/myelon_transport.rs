@@ -116,6 +116,8 @@ impl MyelonOutputSocket {
 /// sides MUST produce the same string for the same input or the
 /// attach fails — keep this in sync with the Python implementation
 /// in `crates/myelon-zmq-py/myelon_pyzmq_shim/hot_path.py`.
+pub fn segment_from_endpoint_for_test(endpoint: &str) -> String { segment_from_endpoint(endpoint) }
+
 fn segment_from_endpoint(endpoint: &str) -> String {
     if let Some(path) = endpoint.strip_prefix("ipc://") {
         let base = path.rsplit('/').next().unwrap_or(path);
@@ -143,7 +145,13 @@ fn segment_from_endpoint(endpoint: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use myelon_zmq::SendSocket;
+    use std::time::Duration;
 
+    /// Deterministic check: segment names produced from `ipc://` URIs
+    /// match what the Python adapter's `_segment_from_endpoint` would
+    /// produce. If this drifts, the Rust frontend will fail to attach
+    /// to the Python engine's SHM segment.
     #[test]
     fn segment_from_endpoint_matches_python_logic() {
         assert_eq!(
@@ -152,6 +160,30 @@ mod tests {
         );
         let long = "ipc:///tmp/very-long-uuid-1234567890-1234567890-1234567890-1234567890";
         let seg = segment_from_endpoint(long);
-        assert!(seg.len() <= 40);
+        assert!(seg.len() <= 40, "expected ≤40 chars, got {}", seg.len());
     }
+
+    /// Verify the endpoint with no scheme falls back to a sane suffix.
+    #[test]
+    fn segment_from_endpoint_no_scheme_falls_back_to_suffix() {
+        let s = segment_from_endpoint("just-some-name");
+        assert_eq!(s, "just-some-name");
+    }
+
+    /// tcp:// endpoints aren't SHM-attachable — confirm the hash
+    /// fall-back at least produces a deterministic string.
+    #[test]
+    fn segment_from_endpoint_tcp_is_deterministic_hash() {
+        let s1 = segment_from_endpoint("tcp://127.0.0.1:5555");
+        let s2 = segment_from_endpoint("tcp://127.0.0.1:5555");
+        assert_eq!(s1, s2);
+        assert!(s1.starts_with("tcp_"));
+    }
+
+    // End-to-end SHM round-trip and segment-accessor integration
+    // checks live as tests/myelon_transport_e2e.rs at the crate root
+    // — putting them in `mod tests {}` causes a stack overflow because
+    // `RecvSocket<2 MiB>` is constructed on the test thread's stack,
+    // and tokio's default worker stack is only ~512 KB. As integration
+    // tests they run with the OS default 8 MiB stack.
 }
