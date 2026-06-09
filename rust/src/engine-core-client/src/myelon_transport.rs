@@ -231,12 +231,21 @@ impl MyelonNarrowOutputSocket {
     /// endpoint-derived name.
     pub fn connect_to_segment(segment: &str) -> Result<Self, MyelonOutputError> {
         let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        // Wait strategy gated by MYELON_NARROW_WAIT_STRATEGY env var:
+        //   "block" (default) - park the thread, signal-based wake; fair to other tokio tasks
+        //   "spin"            - tight CPU spin; lowest median, can hurt P99 tail under contention
+        // The frontend profile showed receiver active work is <1us/iter, so the wait strategy
+        // dominates tail behavior. Default Block aligns with the upstream myelon default.
+        let wait_strategy = match std::env::var("MYELON_NARROW_WAIT_STRATEGY").as_deref() {
+            Ok("spin") | Ok("busy") | Ok("busyspin") | Ok("BusySpin") => MyelonWaitStrategy::BusySpin,
+            _ => MyelonWaitStrategy::Block,
+        };
         loop {
             match FramedTransportConsumer::attach_with_consumer_id(
                 segment,
                 RING_SLOTS,
                 "vlm_0",
-                MyelonWaitStrategy::BusySpin,
+                wait_strategy,
             ) {
                 Ok(inner) => {
                     return Ok(Self {
