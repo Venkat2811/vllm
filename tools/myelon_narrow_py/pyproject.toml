@@ -1,0 +1,14 @@
+[build-system]
+requires = ["maturin>=1.5,<2"]
+build-backend = "maturin"
+
+[project]
+name = "myelon-narrow-py"
+version = "0.0.0"
+description = "Local PyO3 narrow sender for vLLM's myelon hot-path experiments."
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+
+[tool.maturin]
+module-name = "myelon_narrow_py"
+features = ["pyo3/extension-module"]

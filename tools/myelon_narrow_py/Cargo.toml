@@ -1,0 +1,15 @@
+[package]
+name = "myelon-narrow-py"
+version = "0.0.0"
+description = "Local PyO3 narrow sender for vLLM's myelon hot-path experiments."
+publish = false
+edition = "2024"
+license = "Apache-2.0"
+
+[lib]
+name = "myelon_narrow_py"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.28", features = ["extension-module"] }
+myelon = { path = "vendor/myelon-workspace/crates/myelon" }

@@ -143,26 +143,46 @@ enum EngineStartupState {
 /// or, when built with `--features myelon_hot_path` and `USE_MYELON_HOT_PATH=1`
 /// is set at runtime, a myelon SHM ring (`MyelonOutputSocket`).
 ///
-/// Both variants present the same async `recv_frames` shape that
-/// `run_output_loop` calls.
 pub enum OutputSource {
     Zmq(PullSocket),
     #[cfg(feature = "myelon_hot_path")]
     Myelon(crate::myelon_transport::MyelonOutputSocket),
+    #[cfg(feature = "myelon_hot_path")]
+    MyelonNarrow(crate::myelon_transport::MyelonNarrowOutputSocket),
+}
+
+enum ReceivedOutputMessage {
+    Frames(Vec<Bytes>),
+    Decoded(EngineCoreOutputs),
+    EngineDead,
 }
 
 impl OutputSource {
-    /// Receive one multipart message worth of frames.
-    pub async fn recv_frames(&mut self) -> Result<Vec<Bytes>> {
+    /// Receive one engine output message.
+    async fn recv_message(&mut self) -> Result<ReceivedOutputMessage> {
         match self {
             Self::Zmq(s) => {
                 let msg = s.recv().await?;
-                Ok(msg.into_vec())
+                Ok(ReceivedOutputMessage::Frames(msg.into_vec()))
             }
             #[cfg(feature = "myelon_hot_path")]
             Self::Myelon(s) => s
                 .recv()
                 .await
+                .map(ReceivedOutputMessage::Frames)
+                .map_err(|e| Error::MyelonTransport { message: format!("recv: {e}") }),
+            #[cfg(feature = "myelon_hot_path")]
+            Self::MyelonNarrow(s) => s
+                .recv()
+                .await
+                .map(|msg| match msg {
+                    crate::myelon_transport::NarrowOutputMessage::Outputs(outputs) => {
+                        ReceivedOutputMessage::Decoded(outputs)
+                    }
+                    crate::myelon_transport::NarrowOutputMessage::EngineDead => {
+                        ReceivedOutputMessage::EngineDead
+                    }
+                })
                 .map_err(|e| Error::MyelonTransport { message: format!("recv: {e}") }),
         }
     }
@@ -578,7 +598,7 @@ pub async fn run_output_loop(
     tx: mpsc::Sender<Result<EngineCoreOutputs>>,
 ) {
     loop {
-        let frames = match output_source.recv_frames().await {
+        let message = match output_source.recv_message().await {
             Ok(f) => f,
             Err(error) => {
                 error!(error = %error.as_report(), "failed to receive output message");
@@ -587,26 +607,39 @@ pub async fn run_output_loop(
             }
         };
 
-        let frame_count = frames.len();
-        trace!(frame_count, "received output message");
-        let frame = frames.first().expect("output message must have at least one frame");
-        let frame_len = frame.len();
-        if frame.as_ref() == ENGINE_CORE_DEAD_SENTINEL {
-            warn!("received ENGINE_CORE_DEAD sentinel from engine");
-            let _ = tx.send(Err(Error::EngineCoreDead)).await;
-            return;
-        }
-        let decoded = match decode_engine_core_outputs(&frames) {
-            Ok(decoded) => {
-                trace!(frame_len, outputs = ?decoded, "decoded output message");
-                Ok(decoded)
+        let decoded = match message {
+            ReceivedOutputMessage::Frames(frames) => {
+                let frame_count = frames.len();
+                trace!(frame_count, "received output message");
+                let frame = frames
+                    .first()
+                    .expect("output message must have at least one frame");
+                let frame_len = frame.len();
+                if frame.as_ref() == ENGINE_CORE_DEAD_SENTINEL {
+                    warn!("received ENGINE_CORE_DEAD sentinel from engine");
+                    let _ = tx.send(Err(Error::EngineCoreDead)).await;
+                    return;
+                }
+                match decode_engine_core_outputs(&frames) {
+                    Ok(decoded) => {
+                        trace!(frame_len, outputs = ?decoded, "decoded output message");
+                        Ok(decoded)
+                    }
+                    Err(error) => {
+                        warn!(
+                            frame_len,
+                            error = %error.as_report(),
+                            "failed to decode output message"
+                        );
+                        Err(error)
+                    }
+                }
             }
-            Err(error) => {
-                // If we fail to decode the message from the engine, notify the client but keep
-                // the output loop running to continue processing future
-                // messages from the engine.
-                warn!(frame_len, error = %error.as_report(), "failed to decode output message");
-                Err(error)
+            ReceivedOutputMessage::Decoded(outputs) => Ok(outputs),
+            ReceivedOutputMessage::EngineDead => {
+                warn!("received ENGINE_CORE_DEAD sentinel from engine");
+                let _ = tx.send(Err(Error::EngineCoreDead)).await;
+                return;
             }
         };
 
@@ -628,6 +661,19 @@ pub async fn run_output_loop(
 async fn build_output_source_bind(output_address: &str) -> Result<OutputSourceBound> {
     #[cfg(feature = "myelon_hot_path")]
     {
+        if std::env::var_os("USE_MYELON_NARROW").is_some() {
+            tracing::info!(
+                output_address,
+                "myelon_narrow: rust frontend attaching to raw engine SHM segment"
+            );
+            let sock = crate::myelon_transport::MyelonNarrowOutputSocket::connect(output_address)
+                .map_err(|e| Error::MyelonTransport { message: format!("attach: {e}") })?;
+            let bound = output_address.to_string();
+            return Ok(OutputSourceBound {
+                source: OutputSource::MyelonNarrow(sock),
+                bound_address: bound,
+            });
+        }
         if std::env::var_os("USE_MYELON_HOT_PATH").is_some() {
             tracing::info!(
                 output_address,
