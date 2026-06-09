@@ -6,6 +6,7 @@ license.workspace = true
 
 [features]
 test-util = ["dep:tempfile"]
+myelon_hot_path = ["dep:myelon", "dep:myelon-zmq"]
 
 [dependencies]
 arc-swap.workspace = true
@@ -36,6 +37,8 @@ tokio-util.workspace = true
 tracing.workspace = true
 vllm-metrics.workspace = true
 zeromq.workspace = true
+myelon = { workspace = true, optional = true }
+myelon-zmq = { workspace = true, optional = true }
 
 [dev-dependencies]
 anyhow.workspace = true

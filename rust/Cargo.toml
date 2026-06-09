@@ -44,6 +44,11 @@ hf-hub = { version = "0.5.0", features = ["tokio"] }
 http-body = "1.0.1"
 itertools = "0.14.0"
 libc = "0.2.177"
+
+# Myelon SHM transport — local path deps into the playground checkout.
+# Used by the engine-core-client crate behind the myelon_hot_path feature.
+myelon = { path = "../../myelon-src/crates/myelon" }
+myelon-zmq = { path = "../../myelon-src/crates/myelon-zmq" }
 llm-multimodal = { git = "https://github.com/vllm-project/llm-multimodal", rev = "5b558989844d1c7af3e43d0f604069ffd9c06320" }
 minijinja = { version = "2.0", features = ["unstable_machinery", "json", "builtins", "loader", "loop_controls"] }
 minijinja-contrib = { version = "2.0", features = ["pycompat"] }
