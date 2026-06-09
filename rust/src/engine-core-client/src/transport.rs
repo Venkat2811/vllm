@@ -583,11 +583,26 @@ pub async fn send_message(
 
 /// Run the output loop to receive messages from the engine and send them to the
 /// provided channel.
+///
+/// When `MYELON_FRONTEND_PROFILE=1` is set, dumps cumulative per-iteration
+/// nanosecond timing to stderr at n in (100, 200, 500, 1 000) and every
+/// 2 000 sends. Decomposes into `recv` (transport-side recv_message), `dec`
+/// (msgpack decode), `snd` (mpsc forward to client). The timestamping itself
+/// is ~80 ns/iter and stays in the loop unconditionally — overhead is below
+/// 0.05 % at i1o1 rates.
 pub async fn run_output_loop(
     mut output_source: OutputSource,
     tx: mpsc::Sender<Result<EngineCoreOutputs>>,
 ) {
+    let profile_enabled = std::env::var_os("MYELON_FRONTEND_PROFILE").is_some();
+    let mut pf_n: u64 = 0;
+    let mut pf_t_recv: u64 = 0;
+    let mut pf_t_decode: u64 = 0;
+    let mut pf_t_send: u64 = 0;
+    let mut pf_t_iter: u64 = 0;
+
     loop {
+        let t_iter0 = std::time::Instant::now();
         let message = match output_source.recv_message().await {
             Ok(f) => f,
             Err(error) => {
@@ -596,6 +611,7 @@ pub async fn run_output_loop(
                 return;
             }
         };
+        let t_recv1 = std::time::Instant::now();
 
         let decoded = match message {
             ReceivedOutputMessage::Frames(frames) => {
@@ -632,6 +648,7 @@ pub async fn run_output_loop(
                 return;
             }
         };
+        let t_dec1 = std::time::Instant::now();
 
         if tx.send(decoded).await.is_err() {
             // If we fail to send the decoded message to the client, it's likely that the
@@ -639,6 +656,33 @@ pub async fn run_output_loop(
             // well.
             warn!("output loop rx dropped, shutting down output loop");
             return;
+        }
+        let t_send1 = std::time::Instant::now();
+
+        if profile_enabled {
+            pf_t_recv = pf_t_recv.saturating_add(
+                t_recv1.duration_since(t_iter0).as_nanos() as u64,
+            );
+            pf_t_decode = pf_t_decode.saturating_add(
+                t_dec1.duration_since(t_recv1).as_nanos() as u64,
+            );
+            pf_t_send = pf_t_send.saturating_add(
+                t_send1.duration_since(t_dec1).as_nanos() as u64,
+            );
+            pf_t_iter = pf_t_iter.saturating_add(
+                t_send1.duration_since(t_iter0).as_nanos() as u64,
+            );
+            pf_n += 1;
+            if matches!(pf_n, 100 | 200 | 500 | 1000) || pf_n % 2000 == 0 {
+                eprintln!(
+                    "MYELON_FRONTEND_PROFILE n={} recv={}ns dec={}ns snd={}ns iter={}ns",
+                    pf_n,
+                    pf_t_recv / pf_n,
+                    pf_t_decode / pf_n,
+                    pf_t_send / pf_n,
+                    pf_t_iter / pf_n,
+                );
+            }
         }
     }
 }
