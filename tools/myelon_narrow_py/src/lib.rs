@@ -3,9 +3,9 @@
 use std::time::Duration;
 
 use myelon::transport::{FixedFrame, FramedTransportProducer};
+use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
 
 const FRAME_BYTES: usize = 2 * 1024 * 1024;
 
@@ -40,12 +40,25 @@ impl NarrowSendSocket {
         ))
     }
 
-    fn send(&mut self, payload: &Bound<'_, PyBytes>) -> PyResult<()> {
+    /// Accept any contiguous u8 buffer-protocol object: bytes, bytearray,
+    /// memoryview, numpy arrays. Avoids the bytes() copy at the Python edge
+    /// so the engine can publish straight out of a reused encode_into() buf.
+    /// publish() memcpy's into the SHM ring before returning, so the caller
+    /// is free to reuse the source buffer immediately afterwards.
+    fn send(&mut self, payload: &Bound<'_, PyAny>) -> PyResult<()> {
         let inner = self
             .inner
             .as_mut()
             .ok_or_else(|| PyRuntimeError::new_err("send on closed NarrowSendSocket"))?;
-        inner.publish(payload.as_bytes(), 0);
+        let buf: PyBuffer<u8> = PyBuffer::get(payload)?;
+        if !buf.is_c_contiguous() {
+            return Err(PyRuntimeError::new_err(
+                "NarrowSendSocket.send requires a C-contiguous buffer",
+            ));
+        }
+        let len = buf.item_count();
+        let slice = unsafe { std::slice::from_raw_parts(buf.buf_ptr() as *const u8, len) };
+        inner.publish(slice, 0);
         Ok(())
     }
 

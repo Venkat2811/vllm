@@ -1558,16 +1558,22 @@ class EngineCoreProc(EngineCore):
                     reuse_buffers.append(pending.pop()[2])
 
                 if use_myelon_narrow:
-                    buffers = encoder.encode(outputs)
+                    # Mirror the multipart path: reuse a pooled bytearray
+                    # via encode_into() so large payloads don't fresh-alloc
+                    # every send. Narrow publish() memcpy's into the SHM
+                    # ring synchronously, so the buffer is free to reuse
+                    # the moment send() returns (no tracker needed).
+                    buffer = reuse_buffers.pop() if reuse_buffers else bytearray()
+                    buffers = encoder.encode_into(outputs, buffer)
                     if len(buffers) != 1:
                         raise RuntimeError(
                             "USE_MYELON_NARROW expected a single msgpack "
                             f"buffer, got {len(buffers)}. This workload still "
                             "needs the multipart transport."
                         )
-                    sockets[client_index].send(
-                        buffers[0], copy=False, track=True
-                    )
+                    sockets[client_index].send(buffers[0])
+                    if len(reuse_buffers) < max_reuse_bufs:
+                        reuse_buffers.append(buffer)
                     continue
 
                 buffer = reuse_buffers.pop() if reuse_buffers else bytearray()

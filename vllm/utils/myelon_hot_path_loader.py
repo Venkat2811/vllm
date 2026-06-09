@@ -130,8 +130,9 @@ class NarrowOutputSender:
             raise RuntimeError(
                 "myelon narrow: send called after close() on NarrowOutputSender"
             )
-        if not isinstance(payload, bytes):
-            payload = bytes(payload)
+        # NarrowSendSocket.send now accepts any C-contiguous u8 buffer-protocol
+        # object (bytes, bytearray, memoryview). Skip the bytes(payload) cast
+        # so encode_into()'s reused bytearray reaches Rust without realloc.
         if (
             not self._consumer_discovered
             and not self._discovery_retry_exhausted
