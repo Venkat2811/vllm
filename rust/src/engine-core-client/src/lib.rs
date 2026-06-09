@@ -15,7 +15,7 @@ pub use client::{
     EngineCoreStreamOutput, TransportMode,
 };
 pub use error::{Error, Result};
-pub use transport::{ENGINE_CORE_DEAD_SENTINEL, EngineId};
+pub use transport::{ENGINE_CORE_DEAD_SENTINEL, EngineId, OutputSource, run_output_loop};
 
 #[cfg(test)]
 mod tests;

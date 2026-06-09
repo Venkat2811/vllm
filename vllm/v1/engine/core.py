@@ -1572,12 +1572,22 @@ class EngineCoreProc(EngineCore):
         # We must set linger to ensure the ENGINE_CORE_DEAD
         # message is sent prior to closing the socket.
         with ExitStack() as stack, zmq.Context() as ctx:
-            sockets = [
-                stack.enter_context(
-                    make_zmq_socket(ctx, output_path, zmq.PUSH, linger=4000)
-                )
-                for output_path in output_paths
-            ]
+            from vllm.utils.myelon_hot_path_loader import (
+                is_enabled as _use_myelon,
+                is_narrow_enabled as _use_myelon_narrow,
+                make_output_sender as _mk_send,
+            )
+            use_myelon = _use_myelon()
+            use_myelon_narrow = _use_myelon_narrow()
+            if use_myelon:
+                sockets = [_mk_send(p) for p in output_paths]
+            else:
+                sockets = [
+                    stack.enter_context(
+                        make_zmq_socket(ctx, output_path, zmq.PUSH, linger=4000)
+                    )
+                    for output_path in output_paths
+                ]
             coord_socket = (
                 stack.enter_context(
                     make_zmq_socket(
@@ -1609,6 +1619,19 @@ class EngineCoreProc(EngineCore):
                 # Reclaim buffers that zmq is finished with.
                 while pending and pending[-1][0].done:
                     reuse_buffers.append(pending.pop()[2])
+
+                if use_myelon_narrow:
+                    buffers = encoder.encode(outputs)
+                    if len(buffers) != 1:
+                        raise RuntimeError(
+                            "USE_MYELON_NARROW expected a single msgpack "
+                            f"buffer, got {len(buffers)}. This workload still "
+                            "needs the multipart transport."
+                        )
+                    sockets[client_index].send(
+                        buffers[0], copy=False, track=True
+                    )
+                    continue
 
                 buffer = reuse_buffers.pop() if reuse_buffers else bytearray()
                 buffers = encoder.encode_into(outputs, buffer)

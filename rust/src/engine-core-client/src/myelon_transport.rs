@@ -29,7 +29,13 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use bytes::Bytes;
+use myelon::transport::{
+    FixedFrame, FramedTransportConsumer, MyelonWaitStrategy, ReassemblyBuffer,
+};
 use myelon_zmq::RecvSocket;
+
+use crate::protocol::{EngineCoreOutputs, decode_msgpack};
+use crate::transport::ENGINE_CORE_DEAD_SENTINEL;
 
 /// Per-frame SHM payload capacity. Must match `FRAME_BYTES_SHM` in
 /// `crates/myelon-zmq-py/src/lib.rs:140`. Both ends use the same
@@ -60,6 +66,8 @@ pub enum MyelonOutputError {
     Attach(String),
     #[error("myelon recv: {0}")]
     Recv(String),
+    #[error("myelon decode: {0}")]
+    Decode(String),
 }
 
 /// Rust-frontend-side receiver for engine outputs over a myelon SHM
@@ -87,17 +95,26 @@ impl MyelonOutputSocket {
     /// derivation as the Python adapter's `_segment_from_endpoint`.
     pub fn connect(endpoint: &str) -> Result<Self, MyelonOutputError> {
         let segment = segment_from_endpoint(endpoint);
+        Self::connect_to_segment(&segment)
+    }
+
+    /// Attach directly to a known segment name.
+    ///
+    /// This is mainly for local replay/tests where both ends of the
+    /// transport are under our control and we do not need to mirror
+    /// vLLM's `ipc://...` endpoint-derived naming.
+    pub fn connect_to_segment(segment: &str) -> Result<Self, MyelonOutputError> {
         // The Python OutputReceiver attaches eagerly in a daemon
         // thread for up to MYELON_HOT_PATH_ATTACH_TIMEOUT seconds.
         // The rust counterpart does the same retry — the engine may
         // not have bound its SHM ring yet when this is called.
         let deadline = std::time::Instant::now() + Duration::from_secs(120);
         loop {
-            match RecvSocket::connect(&segment, RING_SLOTS, "vlm_0") {
+            match RecvSocket::connect(segment, RING_SLOTS, "vlm_0") {
                 Ok(inner) => {
                     return Ok(Self {
                         inner,
-                        segment,
+                        segment: segment.to_string(),
                         pending: VecDeque::with_capacity(MAX_DRAIN_BATCH),
                     });
                 }
@@ -175,6 +192,114 @@ impl MyelonOutputSocket {
     pub fn segment(&self) -> &str {
         &self.segment
     }
+}
+
+/// Narrow-path message returned from [`MyelonNarrowOutputSocket`].
+///
+/// The sender publishes the raw msgpack payload directly into the SHM
+/// slot. That lets the receiver decode from borrowed slot bytes without
+/// first rebuilding a multipart frame vector.
+pub enum NarrowOutputMessage {
+    Outputs(EngineCoreOutputs),
+    EngineDead,
+}
+
+/// Rust-frontend-side receiver for the true narrow path.
+///
+/// Unlike [`MyelonOutputSocket`], this receiver does not unpack a
+/// multipart envelope and does not copy the message bytes into
+/// `Vec<Bytes>`. It decodes `EngineCoreOutputs` directly from the
+/// leased SHM slot bytes and only allocates the resulting protocol
+/// objects.
+pub struct MyelonNarrowOutputSocket {
+    inner: FramedTransportConsumer<FixedFrame<FRAME_BYTES>>,
+    reassembly_buf: ReassemblyBuffer,
+    segment: String,
+    pending: VecDeque<NarrowOutputMessage>,
+}
+
+impl MyelonNarrowOutputSocket {
+    pub fn connect(endpoint: &str) -> Result<Self, MyelonOutputError> {
+        let segment = segment_from_endpoint(endpoint);
+        Self::connect_to_segment(&segment)
+    }
+
+    /// Attach directly to a known segment name.
+    ///
+    /// Used by the replay/example path where we control both ends and
+    /// want the substrate's portable name helper instead of vLLM's
+    /// endpoint-derived name.
+    pub fn connect_to_segment(segment: &str) -> Result<Self, MyelonOutputError> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        loop {
+            match FramedTransportConsumer::attach_with_consumer_id(
+                segment,
+                RING_SLOTS,
+                "vlm_0",
+                MyelonWaitStrategy::BusySpin,
+            ) {
+                Ok(inner) => {
+                    return Ok(Self {
+                        inner,
+                        reassembly_buf: ReassemblyBuffer::new(64),
+                        segment: segment.to_string(),
+                        pending: VecDeque::with_capacity(MAX_DRAIN_BATCH),
+                    });
+                }
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Err(e) => return Err(MyelonOutputError::Attach(e.to_string())),
+            }
+        }
+    }
+
+    pub async fn recv(&mut self) -> Result<NarrowOutputMessage, MyelonOutputError> {
+        if let Some(msg) = self.pending.pop_front() {
+            return Ok(msg);
+        }
+        loop {
+            let mut got_one: Option<Result<NarrowOutputMessage, MyelonOutputError>> = None;
+            self.inner
+                .try_recv_message_leased(&mut self.reassembly_buf, |_kind, bytes| {
+                    got_one = Some(decode_narrow_message(bytes));
+                });
+            if let Some(first) = got_one {
+                let first = first?;
+                let mut extras_drained = 0;
+                while extras_drained < MAX_DRAIN_BATCH - 1 {
+                    let mut more: Option<Result<NarrowOutputMessage, MyelonOutputError>> = None;
+                    self.inner
+                        .try_recv_message_leased(&mut self.reassembly_buf, |_kind, bytes| {
+                            more = Some(decode_narrow_message(bytes));
+                        });
+                    match more {
+                        Some(Ok(msg)) => {
+                            self.pending.push_back(msg);
+                            extras_drained += 1;
+                        }
+                        Some(Err(err)) => return Err(err),
+                        None => break,
+                    }
+                }
+                return Ok(first);
+            }
+            std::hint::spin_loop();
+            tokio::task::yield_now().await;
+        }
+    }
+
+    pub fn segment(&self) -> &str {
+        &self.segment
+    }
+}
+
+fn decode_narrow_message(bytes: &[u8]) -> Result<NarrowOutputMessage, MyelonOutputError> {
+    if bytes == ENGINE_CORE_DEAD_SENTINEL {
+        return Ok(NarrowOutputMessage::EngineDead);
+    }
+    let decoded = decode_msgpack(bytes).map_err(|e| MyelonOutputError::Decode(e.to_string()))?;
+    Ok(NarrowOutputMessage::Outputs(decoded))
 }
 
 /// Mirror of the Python adapter's `_segment_from_endpoint`. Both
