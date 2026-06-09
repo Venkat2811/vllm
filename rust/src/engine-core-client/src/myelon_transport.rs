@@ -267,11 +267,36 @@ impl MyelonNarrowOutputSocket {
         if let Some(msg) = self.pending.pop_front() {
             return Ok(msg);
         }
+        // Outlier-detection: when MYELON_NARROW_RECV_OUTLIER_MS is set, any
+        // recv iter that takes longer than the threshold gets a stderr line
+        // with the spin count and decode time. Helps attribute the structural
+        // P99 TTFT gap (~12 ms above pyzmq at i1o1) to either spin-budget,
+        // decode-time, or upstream engine pause.
+        let outlier_threshold_ms: u64 = std::env::var("MYELON_NARROW_RECV_OUTLIER_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let t_enter = if outlier_threshold_ms > 0 {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let mut spin_count: u64 = 0;
+        let mut decode_total_ns: u64 = 0;
         loop {
             let mut got_one: Option<Result<NarrowOutputMessage, MyelonOutputError>> = None;
             self.inner
                 .try_recv_message_leased(&mut self.reassembly_buf, |_kind, bytes| {
+                    let t_dec0 = if outlier_threshold_ms > 0 {
+                        Some(std::time::Instant::now())
+                    } else {
+                        None
+                    };
                     got_one = Some(decode_narrow_message(bytes));
+                    if let Some(t0) = t_dec0 {
+                        decode_total_ns =
+                            decode_total_ns.saturating_add(t0.elapsed().as_nanos() as u64);
+                    }
                 });
             if let Some(first) = got_one {
                 let first = first?;
@@ -291,8 +316,18 @@ impl MyelonNarrowOutputSocket {
                         None => break,
                     }
                 }
+                if let Some(t0) = t_enter {
+                    let elapsed_ms = t0.elapsed().as_millis() as u64;
+                    if elapsed_ms >= outlier_threshold_ms {
+                        eprintln!(
+                            "MYELON_NARROW_RECV_OUTLIER elapsed_ms={} spins={} decode_ns={} extras={}",
+                            elapsed_ms, spin_count, decode_total_ns, extras_drained,
+                        );
+                    }
+                }
                 return Ok(first);
             }
+            spin_count = spin_count.saturating_add(1);
             std::hint::spin_loop();
             tokio::task::yield_now().await;
         }
