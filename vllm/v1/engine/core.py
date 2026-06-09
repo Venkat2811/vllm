@@ -1560,6 +1560,19 @@ class EngineCoreProc(EngineCore):
     ):
         """Output socket IO thread."""
 
+        # Gated narrow-path nanosecond profiling. Set MYELON_NARROW_PROFILE=1
+        # to enable per-component aggregate timing dumps every 5000 sends
+        # plus a final summary at shutdown.
+        _profile_narrow = bool(os.environ.get("MYELON_NARROW_PROFILE"))
+        _pf_n = 0
+        _pf_t_get = 0    # output_queue.get() blocking time
+        _pf_t_pop = 0    # reuse_buffers pop or fresh bytearray
+        _pf_t_enc = 0    # encoder.encode_into
+        _pf_t_snd = 0    # sockets[idx].send (Python wrapper + PyO3 + SHM publish)
+        _pf_t_app = 0    # reuse_buffers append
+        _pf_t_iter = 0   # total wall time inside this iteration's narrow branch
+        _pf_perf = time.perf_counter_ns
+
         # Msgpack serialization encoding.
         encoder = MsgpackEncoder()
         # Send buffers to reuse.
@@ -1599,9 +1612,30 @@ class EngineCoreProc(EngineCore):
             )
             max_reuse_bufs = len(sockets) + 1
 
+            import sys as _pf_sys
+            def _pf_dump(tag):
+                _pf_sys.stderr.write(
+                    "MYELON_NARROW_PROFILE {tag} n={n} "
+                    "get={g:.0f}ns pop={p:.0f}ns enc={e:.0f}ns snd={s:.0f}ns "
+                    "app={a:.0f}ns iter={i:.0f}ns\n".format(
+                        tag=tag, n=_pf_n,
+                        g=_pf_t_get / max(1, _pf_n),
+                        p=_pf_t_pop / max(1, _pf_n),
+                        e=_pf_t_enc / max(1, _pf_n),
+                        s=_pf_t_snd / max(1, _pf_n),
+                        a=_pf_t_app / max(1, _pf_n),
+                        i=_pf_t_iter / max(1, _pf_n),
+                    )
+                )
+                _pf_sys.stderr.flush()
+
             while True:
+                _t_get0 = _pf_perf() if _profile_narrow else 0
                 output = self.output_queue.get()
+                _t_get1 = _pf_perf() if _profile_narrow else 0
                 if output == EngineCoreProc.ENGINE_CORE_DEAD:
+                    if _profile_narrow and _pf_n:
+                        _pf_dump("FINAL")
                     for socket in sockets:
                         socket.send(output)
                     break
@@ -1626,8 +1660,11 @@ class EngineCoreProc(EngineCore):
                     # every send. Narrow publish() memcpy's into the SHM
                     # ring synchronously, so the buffer is free to reuse
                     # the moment send() returns (no tracker needed).
+                    _t_pop0 = _pf_perf() if _profile_narrow else 0
                     buffer = reuse_buffers.pop() if reuse_buffers else bytearray()
+                    _t_pop1 = _pf_perf() if _profile_narrow else 0
                     buffers = encoder.encode_into(outputs, buffer)
+                    _t_enc1 = _pf_perf() if _profile_narrow else 0
                     if len(buffers) != 1:
                         raise RuntimeError(
                             "USE_MYELON_NARROW expected a single msgpack "
@@ -1635,8 +1672,23 @@ class EngineCoreProc(EngineCore):
                             "needs the multipart transport."
                         )
                     sockets[client_index].send(buffers[0])
+                    _t_snd1 = _pf_perf() if _profile_narrow else 0
                     if len(reuse_buffers) < max_reuse_bufs:
                         reuse_buffers.append(buffer)
+                    _t_app1 = _pf_perf() if _profile_narrow else 0
+                    if _profile_narrow:
+                        _pf_t_get += _t_get1 - _t_get0
+                        _pf_t_pop += _t_pop1 - _t_pop0
+                        _pf_t_enc += _t_enc1 - _t_pop1
+                        _pf_t_snd += _t_snd1 - _t_enc1
+                        _pf_t_app += _t_app1 - _t_snd1
+                        _pf_t_iter += _t_app1 - _t_get0
+                        _pf_n += 1
+                        # Lower threshold + intermediate dumps to stderr so
+                        # we get data even with batching keeping send-rate low
+                        # (e.g. ~40 sends/sec at i1o1 conc=64).
+                        if _pf_n in (100, 200, 500, 1000) or _pf_n % 2000 == 0:
+                            _pf_dump("STEP")
                     continue
 
                 buffer = reuse_buffers.pop() if reuse_buffers else bytearray()
