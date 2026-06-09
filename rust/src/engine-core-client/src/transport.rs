@@ -125,14 +125,47 @@ pub struct ConnectedTransport {
 
     /// The sending half of the shared input socket.
     pub input_send: RouterSendHalf,
-    /// The shared output socket for receiving responses from all engines.
-    pub output_socket: PullSocket,
+    /// The shared output source for receiving responses from all engines.
+    /// Defaults to a zmq PullSocket; can be a myelon SHM socket when the
+    /// crate is built with `--features myelon_hot_path` and the
+    /// `USE_MYELON_HOT_PATH` env var is set at runtime.
+    pub output_source: OutputSource,
 }
 
 #[derive(Clone, Debug, EnumAsInner)]
 enum EngineStartupState {
     HelloReceived,
     ReadyReceived,
+}
+
+
+/// Source for engine output frames — either the default zeromq PullSocket
+/// or, when built with `--features myelon_hot_path` and `USE_MYELON_HOT_PATH=1`
+/// is set at runtime, a myelon SHM ring (`MyelonOutputSocket`).
+///
+/// Both variants present the same async `recv_frames` shape that
+/// `run_output_loop` calls.
+pub enum OutputSource {
+    Zmq(PullSocket),
+    #[cfg(feature = "myelon_hot_path")]
+    Myelon(crate::myelon_transport::MyelonOutputSocket),
+}
+
+impl OutputSource {
+    /// Receive one multipart message worth of frames.
+    pub async fn recv_frames(&mut self) -> Result<Vec<Bytes>> {
+        match self {
+            Self::Zmq(s) => {
+                let msg = s.recv().await?;
+                Ok(msg.into_vec())
+            }
+            #[cfg(feature = "myelon_hot_path")]
+            Self::Myelon(s) => s
+                .recv()
+                .await
+                .map_err(|e| Error::MyelonTransport { message: format!("recv: {e}") }),
+        }
+    }
 }
 
 /// Connect to one or more engines through the startup handshake protocol,
@@ -311,7 +344,7 @@ pub async fn connect_handshake(
         input_address,
         output_address,
         input_send,
-        output_socket,
+        output_source: OutputSource::Zmq(output_socket),
         engines,
         coordinator,
     })
@@ -337,8 +370,9 @@ pub async fn connect_bootstrapped(
     let mut input_socket = RouterSocket::new();
     let input_address = input_socket.bind(input_address).await?.to_string();
 
-    let mut output_socket = PullSocket::new();
-    let output_address = output_socket.bind(output_address).await?.to_string();
+    let bound = build_output_source_bind(output_address).await?;
+    let output_address = bound.bound_address();
+    let output_source: OutputSource = bound.into();
 
     let engines = wait_for_input_registrations(
         &mut input_socket,
@@ -360,7 +394,7 @@ pub async fn connect_bootstrapped(
         engines,
         coordinator: None,
         input_send,
-        output_socket,
+        output_source,
     })
 }
 
@@ -530,25 +564,21 @@ pub async fn send_message(
 /// Run the output loop to receive messages from the engine and send them to the
 /// provided channel.
 pub async fn run_output_loop(
-    mut output_socket: PullSocket,
+    mut output_source: OutputSource,
     tx: mpsc::Sender<Result<EngineCoreOutputs>>,
 ) {
     loop {
-        let message = match output_socket.recv().await {
-            Ok(message) => message,
+        let frames = match output_source.recv_frames().await {
+            Ok(f) => f,
             Err(error) => {
-                // If we fail to receive a message from the engine, it's likely that the engine
-                // has crashed or become unreachable, so we should notify the
-                // client and shut down the output loop.
                 error!(error = %error.as_report(), "failed to receive output message");
-                let _ = tx.send(Err(Error::Transport(error))).await;
+                let _ = tx.send(Err(error)).await;
                 return;
             }
         };
 
-        let frame_count = message.len();
+        let frame_count = frames.len();
         trace!(frame_count, "received output message");
-        let frames = message.into_vec();
         let frame = frames.first().expect("output message must have at least one frame");
         let frame_len = frame.len();
         if frame.as_ref() == ENGINE_CORE_DEAD_SENTINEL {
@@ -577,6 +607,53 @@ pub async fn run_output_loop(
             warn!("output loop rx dropped, shutting down output loop");
             return;
         }
+    }
+}
+
+
+
+/// Build an `OutputSource` for the bootstrapped path: SHM via myelon when
+/// the crate is built with `myelon_hot_path` AND the runtime env var
+/// `USE_MYELON_HOT_PATH` is set, otherwise the default zmq PullSocket.
+async fn build_output_source_bind(output_address: &str) -> Result<OutputSourceBound> {
+    #[cfg(feature = "myelon_hot_path")]
+    {
+        if std::env::var_os("USE_MYELON_HOT_PATH").is_some() {
+            tracing::info!(
+                output_address,
+                "myelon_hot_path: rust frontend attaching to engine SHM segment"
+            );
+            let sock = crate::myelon_transport::MyelonOutputSocket::connect(output_address)
+                .map_err(|e| Error::MyelonTransport { message: format!("attach: {e}") })?;
+            let bound = output_address.to_string();
+            return Ok(OutputSourceBound {
+                source: OutputSource::Myelon(sock),
+                bound_address: bound,
+            });
+        }
+    }
+    let mut sock = PullSocket::new();
+    let bound = sock.bind(output_address).await?.to_string();
+    Ok(OutputSourceBound {
+        source: OutputSource::Zmq(sock),
+        bound_address: bound,
+    })
+}
+
+struct OutputSourceBound {
+    source: OutputSource,
+    bound_address: String,
+}
+
+impl OutputSourceBound {
+    fn bound_address(&self) -> String {
+        self.bound_address.clone()
+    }
+}
+
+impl From<OutputSourceBound> for OutputSource {
+    fn from(b: OutputSourceBound) -> Self {
+        b.source
     }
 }
 

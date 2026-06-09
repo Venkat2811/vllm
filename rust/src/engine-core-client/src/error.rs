@@ -86,6 +86,11 @@ pub enum Error {
     #[error("utility call `{method}` returned inconsistent results across engines: {values}")]
     InconsistentUtilityResults { method: String, values: String },
 
+    /// myelon hot-path SHM transport error (only produced when built
+    /// with `--features myelon_hot_path` and the runtime path is selected).
+    #[error("myelon SHM transport error: {message}")]
+    MyelonTransport { message: String },
+
     /// A special variant to allow cloning the same error.
     #[error(transparent)]
     Shared(Arc<Self>),

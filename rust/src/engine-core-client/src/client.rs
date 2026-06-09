@@ -281,7 +281,7 @@ impl EngineCoreClient {
             &engines,
         ));
         let output_task = AbortOnDropHandle::new(tokio::spawn(transport::run_output_loop(
-            connected.output_socket,
+            connected.output_source,
             output_tx,
         )));
         let dispatcher_task = AbortOnDropHandle::new(tokio::spawn(run_output_dispatcher_loop(
@@ -303,7 +303,7 @@ impl EngineCoreClient {
                 let (coordinator_output_tx, coordinator_output_rx) = mpsc::channel(64);
                 let coordinator_output_task =
                     AbortOnDropHandle::new(tokio::spawn(transport::run_output_loop(
-                        coordinator_transport.output_socket,
+                        transport::OutputSource::Zmq(coordinator_transport.output_socket),
                         coordinator_output_tx,
                     )));
                 let coordinator_task = AbortOnDropHandle::new(tokio::spawn(
