@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, cast
 from unittest.mock import patch
 
 import msgspec
-import zmq
+from vllm.utils.myelon_zmq_loader import zmq
 
 from vllm import envs
 from vllm.config import CacheConfig, ParallelConfig, VllmConfig

@@ -14,8 +14,7 @@ from typing import Any
 from uuid import uuid4
 
 import psutil
-import zmq
-import zmq.asyncio
+from vllm.utils.myelon_zmq_loader import zmq, zmq_asyncio
 from urllib3.util import parse_url
 
 import vllm.envs as envs
@@ -24,7 +23,7 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
-def close_sockets(sockets: Sequence[zmq.Socket | zmq.asyncio.Socket]):
+def close_sockets(sockets: Sequence[zmq.Socket | zmq_asyncio.Socket]):
     for sock in sockets:
         if sock is not None:
             sock.close(linger=0)
@@ -282,14 +281,14 @@ def make_zmq_path(scheme: str, host: str, port: int | None = None) -> str:
 
 # Adapted from: https://github.com/sgl-project/sglang/blob/v0.4.1/python/sglang/srt/utils.py#L783 # noqa: E501
 def make_zmq_socket(
-    ctx: zmq.asyncio.Context | zmq.Context,  # type: ignore[name-defined]
+    ctx: zmq_asyncio.Context | zmq.Context,  # type: ignore[name-defined]
     path: str,
     socket_type: Any,
     bind: bool | None = None,
     identity: bytes | None = None,
     linger: int | None = None,
     router_handover: bool = False,
-) -> zmq.Socket | zmq.asyncio.Socket:  # type: ignore[name-defined]
+) -> zmq.Socket | zmq_asyncio.Socket:  # type: ignore[name-defined]
     """Make a ZMQ socket with the proper bind/connect semantics."""
 
     mem = psutil.virtual_memory()

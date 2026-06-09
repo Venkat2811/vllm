@@ -17,8 +17,7 @@ from threading import Thread
 from typing import Any, TypeAlias, TypeVar
 
 import msgspec.msgpack
-import zmq
-import zmq.asyncio
+from vllm.utils.myelon_zmq_loader import zmq, zmq_asyncio
 
 from vllm.config import VllmConfig
 from vllm.envs import VLLM_ENGINE_READY_TIMEOUT_S
@@ -375,11 +374,11 @@ class BackgroundResources:
     # if CoreEngineActorManager, it manages all engines.
     engine_manager: CoreEngineProcManager | CoreEngineActorManager | None = None
     coordinator: DPCoordinator | None = None
-    output_socket: zmq.Socket | zmq.asyncio.Socket | None = None
-    input_socket: zmq.Socket | zmq.asyncio.Socket | None = None
-    first_req_send_socket: zmq.asyncio.Socket | None = None
-    first_req_rcv_socket: zmq.asyncio.Socket | None = None
-    stats_update_socket: zmq.asyncio.Socket | None = None
+    output_socket: zmq.Socket | zmq_asyncio.Socket | None = None
+    input_socket: zmq.Socket | zmq_asyncio.Socket | None = None
+    first_req_send_socket: zmq_asyncio.Socket | None = None
+    first_req_rcv_socket: zmq_asyncio.Socket | None = None
+    stats_update_socket: zmq_asyncio.Socket | None = None
     output_queue_task: asyncio.Task | None = None
     stats_update_task: asyncio.Task | None = None
     shutdown_path: str | None = None
@@ -397,7 +396,7 @@ class BackgroundResources:
         if self.coordinator is not None:
             self.coordinator.shutdown()
 
-        if isinstance(self.output_socket, zmq.asyncio.Socket):
+        if isinstance(self.output_socket, zmq_asyncio.Socket):
             # Async case.
             loop = self.output_queue_task._loop if self.output_queue_task else None
 
@@ -483,7 +482,7 @@ class MPClient(EngineCoreClient):
 
         # ZMQ setup.
         sync_ctx = zmq.Context(io_threads=2)
-        self.ctx = zmq.asyncio.Context(sync_ctx) if asyncio_mode else sync_ctx
+        self.ctx = zmq_asyncio.Context(sync_ctx) if asyncio_mode else sync_ctx
 
         # This will ensure resources created so far are closed
         # when the client is garbage collected, even if an
@@ -1224,14 +1223,14 @@ class DPAsyncMPClient(AsyncMPClient):
                     self.ctx, self.first_req_sock_addr, zmq.PAIR, bind=False, linger=0
                 ) as first_req_rcv_socket,
             ):
-                assert isinstance(socket, zmq.asyncio.Socket)
-                assert isinstance(first_req_rcv_socket, zmq.asyncio.Socket)
+                assert isinstance(socket, zmq_asyncio.Socket)
+                assert isinstance(first_req_rcv_socket, zmq_asyncio.Socket)
                 self.resources.stats_update_socket = socket
                 self.resources.first_req_rcv_socket = first_req_rcv_socket
                 # Send subscription message.
                 await socket.send(b"\x01")
 
-                poller = zmq.asyncio.Poller()
+                poller = zmq_asyncio.Poller()
                 poller.register(socket, zmq.POLLIN)
                 poller.register(first_req_rcv_socket, zmq.POLLIN)
 

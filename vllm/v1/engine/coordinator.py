@@ -7,7 +7,7 @@ import time
 import weakref
 
 import msgspec.msgpack
-import zmq
+from vllm.utils.myelon_zmq_loader import zmq
 
 from vllm.config import ParallelConfig
 from vllm.logger import init_logger

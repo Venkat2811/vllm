@@ -15,7 +15,7 @@ import cloudpickle
 import msgspec
 import numpy as np
 import torch
-import zmq
+from vllm.utils.myelon_zmq_loader import zmq
 from msgspec import msgpack
 from pydantic import GetCoreSchemaHandler
 from pydantic_core import core_schema

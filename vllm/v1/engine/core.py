@@ -18,7 +18,7 @@ from multiprocessing.queues import Queue
 from typing import Any, TypeVar, cast
 
 import msgspec
-import zmq
+from vllm.utils.myelon_zmq_loader import zmq
 
 import vllm.envs as envs
 from vllm.config import ParallelConfig, VllmConfig
