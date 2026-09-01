@@ -20,6 +20,22 @@ from vllm.v1.spec_decode.utils import (
 logger = init_logger(__name__)
 
 
+def _normalize_slot_mappings(
+    slot_mappings: "dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None",
+) -> "dict[str, torch.Tensor] | None":
+    """Collapse per-ubatch slot mappings to a single dict.
+
+    With dual batch overlap, ``GPUModelRunner._get_slot_mappings`` returns one
+    slot-mapping dict per ubatch (``list[dict]``). The drafter forward is never
+    ubatched, so use the first ubatch's dict both for the draft-layer membership
+    check and for the drafter's ForwardContext -- otherwise the raw list reaches
+    ``ForwardContext.slot_mapping`` and ``get_attention_context`` asserts.
+    """
+    if isinstance(slot_mappings, list):
+        return slot_mappings[0] if slot_mappings else None
+    return slot_mappings
+
+
 class DFlashProposer(SpecDecodeBaseProposer):
     def __init__(
         self,
@@ -233,6 +249,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
         # Slot mapping sized to num_input_tokens (query only), matching
         # the K/V tensor size from the model forward.  Context KVs are
         # pre-inserted separately and don't flow through the model.
+        slot_mappings = _normalize_slot_mappings(slot_mappings)
         if (
             self._draft_attn_layer_names
             and slot_mappings is not None
