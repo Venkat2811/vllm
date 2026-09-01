@@ -33,18 +33,28 @@ logger = init_logger(__name__)
 
 def _cat_ubatch_outputs(
     sorted_results: list,
-) -> "torch.Tensor | tuple[torch.Tensor, ...]":
+) -> "torch.Tensor | tuple[torch.Tensor, ...] | list[torch.Tensor]":
     """Concatenate per-ubatch model outputs along the batch dim.
 
     Most models return a single hidden-states tensor per ubatch. Target
     models running with auxiliary output (e.g. EAGLE3 speculative decoding,
-    which collects aux hidden states for the drafter) return a tuple of
-    tensors instead. Fan out over tuple components so `torch.cat` sees
-    matching shapes and the caller receives the same structure the model
-    produced for a single ubatch (#40769).
+    which collects aux hidden states for the drafter) return a sequence of
+    tensors instead. Fan out over the components so `torch.cat` sees matching
+    shapes and the caller receives the same structure the model produced for
+    a single ubatch (#40769).
+
+    The sequence may be a ``list`` as well as a ``tuple``, and it may nest --
+    DFlash drafters collect per-layer auxiliary hidden states, producing
+    ``[hidden_states, [aux_0, aux_1, ...]]``. Recurse so every leaf is
+    concatenated and the original container types are preserved.
     """
-    if sorted_results and isinstance(sorted_results[0], tuple):
-        return tuple(torch.cat(parts, dim=0) for parts in zip(*sorted_results))
+    if not sorted_results:
+        return torch.cat(sorted_results, dim=0)
+    first = sorted_results[0]
+    if isinstance(first, (tuple, list)):
+        return type(first)(
+            _cat_ubatch_outputs(list(parts)) for parts in zip(*sorted_results)
+        )
     return torch.cat(sorted_results, dim=0)
 
 
